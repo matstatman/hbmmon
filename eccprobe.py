@@ -213,13 +213,14 @@ def decode_mr4(mr4):
 def query_hbm_mode(card, args):
     """Arm the read-only 10h WDR per FBPA until a clean 3-chunk frame.
 
-    Returns (frame96, fbpa, attempts, note) or (None, reason, ...).
-    The frame is one global stream tapped per FBPA (§11.8/§11.9), so the
-    first clean capture answers for the card.
+    Returns (frame, meta, err): on success (frame96, (fbpa, attempt,
+    how), None); on failure (None, last_note_or_None, err). The
+    frame is one global stream tapped per FBPA (§11.8/§11.9), so
+    the first clean capture answers for the card.
     """
     live = live_fbpas(card.rd)
     if not live:
-        return None, "no live FBPA (cannot query)", None
+        return None, None, "no live FBPA (cannot query)"
     sensors0 = hbm_sentinels(card.rd)
     fbpa_cap = max(1, min(args.fbpa_max, len(live)))
     last_note = ""
@@ -251,19 +252,20 @@ def query_hbm_mode(card, args):
                     frame |= c << (32 * p)
                 new = hbm_sentinels(card.rd)
                 if new != sensors0:
-                    return None, (f"ABORT: sentinels {sensors0} -> {new} "
-                                  f"— reboot the GPU", last_note)
+                    return None, last_note, (
+                        f"ABORT: sentinels {sensors0} -> {new} "
+                        f"— reboot the GPU")
                 dx = xid_since(args.xid0)
                 if dx:
-                    return None, f"ABORT: new Xid: {dx} — reboot the GPU", \
-                        last_note
+                    return None, last_note, (
+                        f"ABORT: new Xid: {dx} — reboot the GPU")
                 return frame, (f, a, how), None
             time.sleep(0.05)
     if not saw_capture:
-        return None, ("I1500 write gate closed (every INSTR write dropped "
-                      "— SEC2 booter PLM opens not installed); HBM mode "
-                      "not readable", last_note)
-    return None, f"no clean 3-chunk frame in budget ({last_note})", None
+        return None, last_note, ("I1500 write gate closed (every INSTR"
+                                 " write dropped — SEC2 booter PLM opens "
+                                 "not installed); HBM mode not readable")
+    return None, None, f"no clean 3-chunk frame in budget ({last_note})"
 
 
 # ---------------------------------------------------------------- sections
