@@ -16,9 +16,13 @@ Card monitor for the NVIDIA CMP 170HX (GA100) whose HBM facts are
   unicast map + the OPT_FBP fuses;
 - **per-stack temperature** — the FB Falcon's own latched TEMPERATURE
   poll, one per FBPA;
-- plus the full card view: 8 GPCs colored by fuses, PCIe link gen/width
-  + throughput fingers, NVLink pad groups from the fuses, 8-pin power,
-  nvtop-style stats panel with sparklines in live mode.
+- **per-GPC BJT-diode temperature** — each GPC cell shows its own
+  calibrated diode, latched per refresh through the NV_THERM snapshot
+  mux (self-restoring recipe, see Safety); blank on indices outside
+  that die's working set — GPC 0 reads invalid on every card measured;
+- plus the full card view: 8 GPC cells colored by fuses, PCIe link
+  gen/width + throughput fingers, NVLink pad groups from the fuses,
+  8-pin power, nvtop-style stats panel with sparklines in live mode.
 
 ## Default run
 
@@ -46,7 +50,7 @@ Options:
 
 ```
 sudo python3 ./hbmmon.py --once        sweep + a single frame, no refresh loop
-sudo python3 ./hbmmon.py --read-only   no sweep: BAR0 reads only, identity '?'
+sudo python3 ./hbmmon.py --read-only   no writes: identity '?', no GPC temps
 sudo python3 ./hbmmon.py --ids         print the per-stack Table 99 table and exit
 sudo python3 ./hbmmon.py --live 1      1 s refresh
 sudo python3 ./hbmmon.py --card 0 --no-color
@@ -61,9 +65,9 @@ the default; `--read-only` is the escape hatch.
 | file          | what |
 |---------------|------|
 | `hbmmon.py`   | the tool: sweep, topology derivation, drawing, live loop |
-| `hbmmap.py`   | shared library: canvas, card/die geometry, nvidia-smi collection, `--mock` snapshot, `/dev/gpcprobe` access |
+| `hbmmap.py`   | shared library: canvas, card/die geometry, nvidia-smi collection, the per-GPC temp snapshot recipe (`gpc_temps`), `--mock` snapshot, `/dev/gpcprobe` access |
 | `gpc_probe.py`| `/dev/gpcprobe` ioctl constants + the I1500 WDR capture engine (`wdr_arm_capture`, sentinels, Xid diff) |
-| `gpcprobe.c`  | kernel module: BAR0 ioremap, 32-bit reads + the allowlisted I1500 writes |
+| `gpcprobe.c`  | kernel module: BAR0 ioremap, 32-bit reads + the allowlisted I1500 and thermal-snapshot writes |
 | `Makefile`    | builds `gpcprobe.ko` against the running kernel |
 
 Self-contained: nothing is imported from outside this directory.
@@ -77,8 +81,11 @@ sudo insmod gpcprobe.ko  # creates /dev/gpcprobe (root, 0600)
 
 Requires `nvidia-smi` on PATH (the driver's own tool; any working
 install) and root for the ioctl device. The module is read-only except
-the I1500 INSTR/MODE control registers, which the kernel enforces —
-everything else is reject-with-EPERM.
+the two allowlisted write recipes (I1500 INSTR/MODE control registers,
+and the thermal snapshot mux + per-GPC TS_AUTO words), which the kernel
+enforces — everything else is reject-with-EPERM. A `gpcprobe.ko` built
+before 2026-11 rejects the thermal offsets: hbmmon then says so once
+per card and the GPC cells stay blank.
 
 ## Safety
 
@@ -89,6 +96,14 @@ everything else is reject-with-EPERM.
   DATA-latch write is the MR-write path, and the 2026-09-25 canaries
   showed it wedges the 1500 bridge card-wide until reboot, so it stays
   out of this tool's surface entirely.
+- **Per-GPC temperature** (measured 2026-11, three GA100 8GB cards)
+  runs the snapshot recipe per refresh: per GPC, capture `TS_AUTO` and
+  clear its autopoll bit (the trigger converts through the same shared
+  sense amp the autopoll uses), select that GPC's diode 0 in the
+  NV_THERM mux, fire the **self-clearing** trigger, read the latched
+  shot (the first read is final), then write the captured `TS_AUTO`
+  word back; the mux index is parked at 0 after every sweep. Four
+  self-restoring writes + five reads per GPC, all logged by the module.
 - Sentinel + Xid gating after every FBPA; abort leaves the registers
   restored (the recipe restores INSTR then MODE before the check).
 - `--read-only` / `--mock` issue no writes at all.

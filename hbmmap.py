@@ -5,10 +5,13 @@ drawing canvas, the die/card geometry constants, the nvidia-smi
 collection, the --mock synthetic snapshot and the /dev/gpcprobe
 hardware access that hbmmon builds its map on.
 
-READ-ONLY: BAR0 reads only (GP_IOC_READ32) plus the nvidia-smi CSV
-query. The only writes the card sees come from hbmmon's startup
-DEVICE_ID sweep, gated in gpc_probe.wdr_arm_capture and allowlisted in
-gpcprobe.c (I1500 INSTR/MODE control registers only).
+Per-tick collection is BAR0 reads (GP_IOC_READ32) plus the nvidia-smi
+CSV query, plus one self-restoring write recipe: gpc_temps, the per-GPC
+BJT snapshot sweep (NV_THERM mux index + trigger; each GPC's TS_AUTO
+autopoll is captured, paused around its shot and written back).
+hbmmon's startup DEVICE_ID sweep adds the I1500 INSTR/MODE writes,
+gated in gpc_probe.wdr_arm_capture. Both write surfaces are
+allowlisted in gpcprobe.c; every other offset is reject-with-EPERM.
 
 Colors: green = active/healthy, dark = disabled (fused off, healthy),
 red = defective.
@@ -67,6 +70,68 @@ def live_fbpas(rd):
         if (cfg1 & 0xFFFF0000) != 0xBADF0000:
             live.append(f)
     return live
+
+
+# --------------------------------------------------------------------------
+# per-GPC BJT-diode temperatures — the NV_THERM snapshot mux (measured
+# 2026-11 on three GA100 8GB cards). Every working GPC exposes a
+# calibrated diode: the index register names the (GPC, diode) pair, the
+# self-clearing trigger converts and latches one shot (diode °C, diode
+# + hotspot offset, card max, card avg), and the conversion is already
+# final on the first read. Valid indices are stable per die — GPC 0 is
+# valid on none of the three cards measured; 4-5 of 8 are.
+
+NV_THERM_GPC_INDEX = 0x00020840       # [19:16] GPC, [3:0] BJT, 30 READINCR
+NV_THERM_GPC_CURR = 0x00020844        # shot: calibrated °C (bit 30 = valid)
+NV_THERM_GPC_OFF_CURR = 0x00020848    # shot: diode + programmed hotspot offset
+NV_THERM_GPU_MAX_SNAP = 0x0002084c    # shot: card maximum
+NV_THERM_GPU_AVG_SNAP = 0x00020850    # shot: card average
+NV_THERM_SNAPSHOT = 0x0002085c        # bit 0 CMD_TRIGGER, self-clearing
+PCHIPLET_TS_AUTO = 0x0010c0f4         # + gpc*0x100: that GPC's autopoll
+TS_AUTO_POLL = 1 << 17                # observed armed word: 0x005a8834
+
+
+def decode_temp(word):
+    """NV_THERM temperature word -> °C, or None when bit 30 (STATE)
+    says invalid. Bits 16:3 are a signed 14-bit 9.5 fixed-point °C
+    (LSB 1/32 °C); bit 31 is the software-override source flag."""
+    if not (word >> 30) & 1:
+        return None
+    f = (word >> 3) & 0x3FFF
+    if f & 0x2000:
+        f -= 0x4000
+    return f / 32.0
+
+
+def gpc_temps(rd, wr):
+    """Calibrated per-GPC diode temperatures, {gpc: °C or None}.
+
+    The measured snapshot recipe, run once per GPC 0..7 (diode 0):
+    capture TS_AUTO, clear its autopoll bit (the trigger converts
+    through the same shared sense amp the autopoll uses), select the
+    diode, trigger, read the latched shot, restore the captured
+    TS_AUTO word — then park the index at 0 after the loop. Indices
+    outside the die's working set latch STATE=0 and decode to None.
+    All writes are self-restoring; OSError from wr (a gpcprobe.ko
+    predating the thermal allowlist) propagates to the caller.
+    """
+    out = {}
+    for g in range(8):
+        auto = PCHIPLET_TS_AUTO + g * 0x100
+        saved = rd(auto)
+        wr(auto, saved & ~TS_AUTO_POLL)
+        wr(NV_THERM_GPC_INDEX, g << 16)   # GPC g, BJT 0, READINCR 0
+        wr(NV_THERM_SNAPSHOT, 1)          # bit 0 self-clears: write = latch
+        out[g] = decode_temp(rd(NV_THERM_GPC_CURR))
+        # the shot's other words — read as measured (they latch together
+        # with the diode word); the card view draws the max/avg elsewhere
+        rd(NV_THERM_GPC_OFF_CURR)
+        rd(NV_THERM_GPU_MAX_SNAP)
+        rd(NV_THERM_GPU_AVG_SNAP)
+        wr(auto, saved)
+    wr(NV_THERM_GPC_INDEX, 0)
+    return out
+
 
 PAL = {
     "g": "\x1b[32m", "G": "\x1b[1;32m",
@@ -370,6 +435,7 @@ def collect(rd, bdf_s, smi):
         "pcie_lanes_on": 16 - len(bits_set(pcie_dis, 16)),
         "gen3_dis": gen3_dis, "tpc": tpc,
         "stacks": stacks, "live_n": len(live), "pkg_state": pkg_state,
+        "gpc_t": None,        # per-GPC diode temps need the snapshot writes
     }
 
 
@@ -388,6 +454,9 @@ _MOCK_LIVE_FBPAS = frozenset((
 ))
 _MOCK_CFG1_LIVE = 0x02779000          # A100-80GB HBM2E config
 _MOCK_STACK_TEMP = {"A": 47, "B": 46, "C": 46, "D": 45}
+# Per-GPC diode shot as measured cold on 06:00.0 (readout 1): working
+# set {2,4,5,6,7} — the other cells stay blank, as they read on hardware.
+_MOCK_GPC_T = {2: 35.7, 4: 35.8, 5: 35.4, 6: 36.0, 7: 35.0}
 
 
 def _clamp(v, lo, hi):
@@ -408,6 +477,15 @@ def mock_temps(t):
             val = base
         for f in (2 * f0, 2 * f0 + 1, 2 * f1, 2 * f1 + 1):
             out[f] = val
+    return out
+
+
+def mock_gpc_temps(t):
+    """Per-GPC diode °C. Exact snapshot at t=0; wobble in --live."""
+    out = {}
+    for g, base in _MOCK_GPC_T.items():
+        out[g] = round(base + 1.6 * math.sin(t / 5.0 + g * 0.7), 1) if t \
+            else base
     return out
 
 
@@ -475,7 +553,9 @@ def mock_smi(bdf_s, t):
 def mock_collect(idx, t=0.0):
     """One synthetic card. `idx` only affects the banner/BDF."""
     bdf_s = f"0000:{6 + idx:02x}:00.0"
-    return collect(mock_rd(mock_temps(t)), bdf_s, mock_smi(bdf_s, t))
+    cs = collect(mock_rd(mock_temps(t)), bdf_s, mock_smi(bdf_s, t))
+    cs["gpc_t"] = mock_gpc_temps(t)      # the snapshot writes are mocked
+    return cs
 
 
 # ---------------------------------------------------------------------------

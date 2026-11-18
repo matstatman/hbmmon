@@ -255,9 +255,11 @@ def ro_stacks(live_set, fbp_dis, fbp_def):
 
 
 # ---------------------------------------------------------------------------
-# per-tick data (reads only; same registers as hbmmap.collect)
+# per-tick data (same read set as hbmmap.collect, plus the self-restoring
+# GPC-temp snapshot sweep when a writer is available)
 
 _PCI_ID_CACHE = {}
+_GPC_T_WR_ERR = set()        # BDFs whose thermal writes were refused
 
 
 def _pci_id(bdf_s):
@@ -282,9 +284,11 @@ def _pci_id(bdf_s):
     return _PCI_ID_CACHE[bdf_s]
 
 
-def collect(rd, bdf_s, smi):
-    """Fuses + TPC status + CFG1 live map + per-FBPA temperatures.
-    Reads only — the topology comes from the startup sweep."""
+def collect(rd, bdf_s, smi, wr=None):
+    """Fuses + TPC status + CFG1 live map + per-FBPA temperatures; with
+    `wr` also the per-GPC diode snapshot (gpc_temps — its only writes
+    are self-restoring). Reads otherwise; the topology comes from the
+    startup sweep."""
     sm = smi.get(bdf_s.lower(), {})
     gpc_dis = rd(hm.OFF_GPC_DIS)
     gpc_def = rd(hm.OFF_GPC_DEF)
@@ -300,6 +304,20 @@ def collect(rd, bdf_s, smi):
         hi = data >> 24
         temps[f] = (hi & 0x7F) if (hi & 0x80) == 0 else None
 
+    gpc_t = None
+    if wr is not None:
+        try:
+            gpc_t = hm.gpc_temps(rd, wr)
+        except OSError as e:
+            # gpcprobe.ko predating the thermal-allowlist extension:
+            # every offset is EPERM, so nothing landed — say it once
+            # per card and draw the cells without temperature
+            if bdf_s.lower() not in _GPC_T_WR_ERR:
+                _GPC_T_WR_ERR.add(bdf_s.lower())
+                print(f"!! {bdf_s}: per-GPC temp writes refused ({e}) — "
+                      "rebuild gpcprobe.ko (thermal mux + TS_AUTO "
+                      "allowlist)", file=sys.stderr)
+
     def pkg_state(f):
         if (fbp_def >> f) & 1:
             return "defective"
@@ -312,7 +330,7 @@ def collect(rd, bdf_s, smi):
         "gpc_dis": gpc_dis, "gpc_def": gpc_def,
         "nvl_dis": nvl_dis, "nvl_def": nvl_def,
         "tpc": tpc, "live": live, "live_n": len(live),
-        "temps": temps, "pkg_state": pkg_state,
+        "temps": temps, "pkg_state": pkg_state, "gpc_t": gpc_t,
         "fbp_dis": fbp_dis, "fbp_def": fbp_def,
     }
 
@@ -483,7 +501,8 @@ def draw_card(cv, cs, topo, hist=None):
     for k, st in enumerate(view["R"]):
         stack_pair(cv, hb_right, hb_y + k * (hm.PAIR_H + 1), st, pkg_state)
 
-    # --- GA100 die: 2×4 GPC grid of 3-row cells, SKU + GPU/MEM temp on rail
+    # --- GA100 die: 2×4 GPC grid of 3-row cells (TPC harvest + the GPC's
+    # BJT diode), SKU + GPU/MEM temp on rail
     cv.box(die_x, die_y, hm.DIE_W, hm.DIE_H, "d")
 
     def gpc_col(i):
@@ -499,8 +518,11 @@ def draw_card(cv, cs, topo, hist=None):
                tl="╭", tr="╮", bl="╰", br="╯")
         p(gx + 2, gy, f" G{gi} ", "w")
         p(gx + 2, gy + 1, f"TPC {n_live}/8", "w")
-        sms = f"{n_live * 2} SM"
-        p(gx + hm.GPC_W - 2 - len(sms), gy + 1, sms, "w" if n_live else "d")
+        # the GPC's own BJT diode (NV_THERM snapshot mux); "--" where
+        # the die has no diode at this index, or writes are not allowed
+        t = (cs.get("gpc_t") or {}).get(gi)
+        ts = f"{t:.1f}°C" if t is not None else "--"
+        p(gx + hm.GPC_W - 2 - len(ts), gy + 1, ts, "w" if t is not None else "d")
 
     gpc_gap = 2
     grid_w = hm.GPC_W * 2 + gpc_gap
@@ -840,7 +862,8 @@ def main():
                          "on by default; use --read-only to skip it")
     ap.add_argument("--read-only", action="store_true",
                     help="skip the startup DEVICE_ID sweep — BAR0 reads "
-                         "only (identity lines read '?')")
+                         "only (identity lines read '?', GPC cells no "
+                         "temperature)")
     ap.add_argument("--ids", action="store_true",
                     help="print the per-stack DEVICE_ID table and exit")
     ap.add_argument("--mock", action="store_true",
@@ -885,6 +908,14 @@ def main():
         else:
             cards = [args.card]
 
+        def _wr_for(idx):
+            """GP_IOC_WRITE bound to one card (allowlist enforced in
+            gpcprobe.c; OSError = offset not allowlisted)."""
+            def wr(off, val):
+                buf = bytearray(struct.pack("<III", idx, off, val))
+                fcntl.ioctl(fd, gp.GP_IOC_WRITE, buf)
+            return wr
+
         # --- startup: CFG1 map + (gated) DEVICE_ID sweep -------------------
         for c in cards:
             rd = hm._hw_rd(fd, fcntl, gp, c)
@@ -894,10 +925,11 @@ def main():
                   + ("" if write_ok
                      else "   (read-only: no DEVICE_ID read)"))
             if write_ok:
+                w = _wr_for(c)
+
                 def wr(off, val):
-                    buf = bytearray(struct.pack("<III", c, off, val))
                     try:
-                        fcntl.ioctl(fd, gp.GP_IOC_WRITE, buf)
+                        w(off, val)
                     except OSError as e:
                         sys.exit(f"write 0x{off:08x}<-0x{val:08x} refused "
                                  f"({e}); rebuild gpcprobe.ko with the "
@@ -945,7 +977,8 @@ def main():
 
         def collect_one(idx):
             return collect(hm._hw_rd(fd, fcntl, gp, idx),
-                           hm._hw_bdf(info, idx), smi())
+                           hm._hw_bdf(info, idx), smi(),
+                           _wr_for(idx) if write_ok else None)
 
     try:
         if live_interval is None:

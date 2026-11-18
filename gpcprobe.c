@@ -5,19 +5,29 @@
  * The proprietary nvidia driver owns the GPU BARs exclusively and zeroes the
  * kernel resource entries, so /sys/.../resource0 (EINVAL) and /dev/mem
  * (STRICT_DEVMEM) cannot reach the register window. This module reads the raw
- * BAR0 config register, ioremaps it, and exposes 32-bit reads + one tightly
- * allowlisted write via /dev/gpcprobe (ioctl).
+ * BAR0 config register, ioremaps it, and exposes 32-bit reads + a hard-
+ * allowlisted write surface via /dev/gpcprobe (ioctl).
  *
- * GP_IOC_WRITE is hard-allowlisted to exactly the I1500 HBM debug bridge
- * INSTR/MODE control registers across the whole aperture family (broadcast
- * 0x009A0000 + 24 unicast 0x00900000 + i*0x00004000,
- * INSTR/MODE at +0x3CB4/+0x3CB8) — the full write surface of hbmmon's
- * startup DEVICE_ID sweep (arm MODE=0x52 stream + WIR, read the frame
- * back, restore). The DATA latch (+0x3CBC) is deliberately NOT in the
- * list: a DATA-latch write is the MR-write path, and the 2026-09-25
- * canaries showed a WDR DATA-latch write wedges the 1500 bridge
- * card-wide until reboot. The RO shadows (+0x3CC0/4) and STATUS (+0x3CC8)
- * are absent too.
+ * GP_IOC_WRITE covers exactly two measured recipes:
+ *
+ * 1. The I1500 HBM debug bridge INSTR/MODE control registers across the
+ *    whole aperture family (broadcast 0x009A0000 + 24 unicast
+ *    0x00900000 + i*0x00004000, INSTR/MODE at +0x3CB4/+0x3CB8) — the
+ *    full write surface of hbmmon's startup DEVICE_ID sweep (arm
+ *    MODE=0x52 stream + WIR, read the frame back, restore). The DATA
+ *    latch (+0x3CBC) is deliberately NOT in the list: a DATA-latch
+ *    write is the MR-write path, and the 2026-09-25 canaries showed a
+ *    WDR DATA-latch write wedges the 1500 bridge card-wide until
+ *    reboot. The RO shadows (+0x3CC0/4) and STATUS (+0x3CC8) are
+ *    absent too.
+ *
+ * 2. The per-GPC temperature snapshot mux (measured 2026-11, GA100
+ *    8GB): NV_THERM_GPC_TSENSE_INDEX_SNAPSHOT 0x00020840, the
+ *    self-clearing NV_THERM_TSENSE_GLOBAL_SNAPSHOT trigger 0x0002085c,
+ *    and the eight PCHIPLET GPC autopoll words 0x0010c0f4 + n*0x100
+ *    that hbmmap.gpc_temps pauses and restores verbatim around each
+ *    latched diode shot (the index is parked at 0 after every sweep).
+ *    The recipe's temperature words are read-only to the host anyway.
  *
  * Every other offset, on every card, is reject-with-EPERM. The I1500
  * bridge is driven by the PKC-encrypted FB Falcon, so treat those writes
@@ -40,7 +50,7 @@
 #include <linux/string.h>
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("hbmmon BAR0 probe (I1500 WDR control writes)");
+MODULE_DESCRIPTION("hbmmon BAR0 probe (I1500 WDR + GPC temp snapshot writes)");
 
 #define GP_IOC_MAGIC 'G'
 struct gp_reg {
@@ -56,13 +66,27 @@ struct gp_info {
 #define GP_IOC_READ32 _IOWR(GP_IOC_MAGIC, 2, struct gp_reg)
 #define GP_IOC_WRITE  _IOW(GP_IOC_MAGIC, 3, struct gp_reg)
 
-/* The only BAR0 offsets GP_IOC_WRITE may touch: the I1500 INSTR/MODE
- * control registers, one block per aperture (broadcast 0x009A0000,
- * unicast 0x00900000 + i*0x00004000, i = 0..23). DATA/STATUS/RO-shadows
- * are intentionally absent (see the file header). */
+/* The only BAR0 offsets GP_IOC_WRITE may touch:
+ *   1. the I1500 INSTR/MODE control registers, one block per aperture
+ *      (broadcast 0x009A0000, unicast 0x00900000 + i*0x00004000,
+ *      i = 0..23). DATA/STATUS/RO-shadows are intentionally absent
+ *      (see the file header);
+ *   2. the per-GPC temperature snapshot recipe (hbmmap.gpc_temps,
+ *      measured 2026-11): the NV_THERM mux index 0x00020840 and the
+ *      self-clearing trigger 0x0002085c, plus the eight GPC autopoll
+ *      words PCHIPLET_TS_AUTO 0x0010c0f4 + n*0x100 that the recipe
+ *      pauses (bit 17) and restores verbatim around each latched shot.
+ *      All self-restoring; reads need no permission (GP_IOC_READ32
+ *      covers the whole window). */
 static int gp_write_allowed(u32 off)
 {
 	u32 base, offblk;
+
+	if (off == 0x00020840 || off == 0x0002085c)
+		return 1;		/* thermal mux index / snapshot trigger */
+	if (off >= 0x0010c0f4 && off <= 0x0010c7f4 &&
+	    !((off - 0x0010c0f4) & 0xFF))
+		return 1;		/* PCHIPLET_TS_AUTO, n = 0..7 */
 
 	if (off >= 0x009A0000 && off < 0x009A4000) {
 		base = 0x009A0000;		/* broadcast */
